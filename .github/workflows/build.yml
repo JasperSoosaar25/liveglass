@@ -1,0 +1,96 @@
+name: Build Unsigned IPA
+
+# Builds Live Glass into an unsigned .ipa using GitHub's free macOS runners.
+# Public repos: builds are free and effectively unlimited.
+# You download the IPA from the run's Artifacts section, then sign it in KravaSign/Feather.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: macos-26   # has Xcode 26 (Liquid Glass SDK). If unavailable, macos-15 also works.
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Create asset catalog (icon + accent color)
+        run: |
+          mkdir -p Assets.xcassets/AppIcon.appiconset Assets.xcassets/AccentColor.colorset
+          cp AppIcon-1024.png Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png
+          cat > Assets.xcassets/Contents.json <<'EOF'
+          {"info":{"author":"xcode","version":1}}
+          EOF
+          cat > Assets.xcassets/AppIcon.appiconset/Contents.json <<'EOF'
+          {
+            "images": [
+              {"filename": "AppIcon-1024.png", "idiom": "universal", "platform": "ios", "size": "1024x1024"}
+            ],
+            "info": {"author": "xcode", "version": 1}
+          }
+          EOF
+          cat > Assets.xcassets/AccentColor.colorset/Contents.json <<'EOF'
+          {
+            "colors": [
+              {
+                "color": {
+                  "color-space": "srgb",
+                  "components": {"alpha": "1.000", "blue": "0.780", "green": "0.760", "red": "0.220"}
+                },
+                "idiom": "universal"
+              }
+            ],
+            "info": {"author": "xcode", "version": 1}
+          }
+          EOF
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Build for device (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project LiveGlass.xcodeproj \
+            -scheme LiveGlass \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            -quiet | tail -50
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          if [ -z "$APP" ]; then
+            echo "::error::No .app product produced"
+            exit 1
+          fi
+          echo "Built: $APP"
+
+      - name: Package unsigned IPA
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          rm -rf Payload LiveGlass-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry LiveGlass-unsigned.ipa Payload
+          ls -lh LiveGlass-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveGlass-unsigned-ipa-${{ github.run_number }}
+          path: LiveGlass-unsigned.ipa
+          retention-days: 90

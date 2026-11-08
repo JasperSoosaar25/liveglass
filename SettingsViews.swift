@@ -5,7 +5,6 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        @Bindable var app = app
         NavigationStack {
             ZStack {
                 AmbientBackdrop()
@@ -30,7 +29,8 @@ struct SettingsView: View {
     }
 
     private var monitoringSection: some View {
-        Section("Monitoring (24/7)") {
+        @Bindable var app = app
+        return Section("Monitoring (24/7)") {
             Toggle(isOn: $app.settings.keepAlive) {
                 Label("Background keep-alive", systemImage: "waveform")
             }
@@ -58,7 +58,8 @@ struct SettingsView: View {
     }
 
     private var recordingSection: some View {
-        Section("Recording") {
+        @Bindable var app = app
+        return Section("Recording") {
             Picker("Split into parts every", selection: $app.settings.splitMinutes) {
                 Text("Never (single file)").tag(0)
                 Text("15 minutes").tag(15)
@@ -79,7 +80,8 @@ struct SettingsView: View {
     }
 
     private var storageSection: some View {
-        Section("Storage") {
+        @Bindable var app = app
+        return Section("Storage") {
             LabeledContent {
                 Text("\(Int(app.settings.minFreeGB)) GB")
             } label: {
@@ -96,7 +98,8 @@ struct SettingsView: View {
     }
 
     private var advancedSection: some View {
-        Section {
+        @Bindable var app = app
+        return Section {
             TextField("sessionid=…; tt-target-idc=…", text: $app.settings.cookies, axis: .vertical)
                 .font(.system(.footnote, design: .monospaced))
                 .textInputAutocapitalization(.never)

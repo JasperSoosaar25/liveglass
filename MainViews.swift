@@ -1,6 +1,7 @@
 import SwiftUI
 import AVKit
 import AVFoundation
+import Combine
 
 // MARK: - Root
 
@@ -354,6 +355,8 @@ struct RecordingsView: View {
                                         RecordingRow(item: item,
                                                      onPlay: playing == nil ? { playing = item } : nil,
                                                      onShare: { shareItem = item },
+                                                     onConvert: (item.state == .ready && item.format == "ts")
+                                                         ? { app.convertRecordingToMP4(item) } : nil,
                                                      onDelete: { confirmDelete = item })
                                     }
                                 }
@@ -401,12 +404,13 @@ struct RecordingRow: View {
     let item: RecordingItem
     let onPlay: (() -> Void)?
     let onShare: () -> Void
+    let onConvert: (() -> Void)?
     let onDelete: () -> Void
 
     var body: some View {
         VStack(spacing: 8) {
             HStack(spacing: 10) {
-                if item.state == .recording {
+                if item.state == .recording || item.state == .converting {
                     ProgressView()
                         .controlSize(.small)
                 } else if item.state == .ready {
@@ -419,7 +423,7 @@ struct RecordingRow: View {
                         .foregroundStyle(.orange)
                 }
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(item.state == .recording ? "@\(item.username) — capturing…" : (item.fileName.isEmpty ? "@\(item.username)" : item.fileName))
+                    Text(titleLine)
                         .font(.footnote.weight(.semibold))
                         .lineLimit(2)
                     Text(metaLine)
@@ -437,6 +441,9 @@ struct RecordingRow: View {
                 }
                 if item.state == .ready && !item.relativePath.isEmpty {
                     action(icon: "square.and.arrow.up", text: "Share") { onShare() }
+                }
+                if let onConvert {
+                    action(icon: "arrow.triangle.2.circlepath", text: "To MP4") { onConvert() }
                 }
                 if item.state != .recording {
                     action(icon: "trash", text: "Delete") { onDelete() }
@@ -458,6 +465,14 @@ struct RecordingRow: View {
             }
         }
         .liquidGlass(cornerRadius: 24, padding: 14)
+    }
+
+    private var titleLine: String {
+        switch item.state {
+        case .recording: return "@\(item.username) — capturing…"
+        case .converting: return "Converting to MP4…"
+        default: return item.fileName.isEmpty ? "@\(item.username)" : item.fileName
+        }
     }
 
     private var iconForFormat: String {
@@ -496,12 +511,31 @@ struct FilePlayerSheet: View {
     let item: RecordingItem
     @Environment(\.dismiss) private var dismiss
     @State private var player: AVPlayer?
+    @State private var playbackFailed = false
+    @State private var statusObserver: AnyCancellable?
 
     var body: some View {
         NavigationStack {
             Group {
                 if let player {
                     VideoPlayer(player: player)
+                        .overlay {
+                            if playbackFailed {
+                                VStack(spacing: 10) {
+                                    Image(systemName: "exclamationmark.tv")
+                                        .font(.largeTitle)
+                                        .foregroundStyle(.secondary)
+                                    Text("iOS can't decode this file.")
+                                        .font(.footnote.weight(.semibold))
+                                    Text("Tap Share and open it in VLC instead.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(22)
+                                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20))
+                                .padding(24)
+                            }
+                        }
                 } else {
                     ProgressView()
                 }
@@ -517,9 +551,21 @@ struct FilePlayerSheet: View {
                 let url = Paths.absoluteURL(forRelativePath: item.relativePath)
                 let p = AVPlayer(url: url)
                 player = p
+                // Rare decode failures (exotic .ts flavor) surface gracefully here.
+                statusObserver = p.currentItem?.publisher(for: \.status)
+                    .receive(on: DispatchQueue.main)
+                    .sink { status in
+                        if status == .failed {
+                            playbackFailed = true
+                            p.pause()
+                        }
+                    }
                 p.play()
             }
-            .onDisappear { player?.pause() }
+            .onDisappear {
+                player?.pause()
+                statusObserver = nil
+            }
         }
     }
 }
@@ -538,5 +584,44 @@ extension AppState {
         try? FileManager.default.removeItem(at: url)
         recordings.removeAll { $0.id == item.id }
         save()
+    }
+
+    /// Losslessly converts a legacy .ts recording to .mp4 (no re-encode) so it plays
+    /// everywhere. The original file is only removed after a successful conversion.
+    func convertRecordingToMP4(_ item: RecordingItem) {
+        guard item.state == .ready, item.format == "ts",
+              let idx = recordings.firstIndex(where: { $0.id == item.id }) else { return }
+        let srcURL = Paths.absoluteURL(forRelativePath: item.relativePath)
+        guard FileManager.default.fileExists(atPath: srcURL.path) else { return }
+        recordings[idx].state = .converting
+        Task {
+            let tmpOut = FileManager.default.temporaryDirectory
+                .appendingPathComponent("liveglass-convert-\(UUID().uuidString).mp4")
+            defer { try? FileManager.default.removeItem(at: tmpOut) }
+
+            var ok = false
+            if await StreamRecorder.remuxToMP4(inputURL: srcURL, outputURL: tmpOut) {
+                let destURL = srcURL.deletingPathExtension().appendingPathExtension("mp4")
+                try? FileManager.default.removeItem(at: destURL)
+                if (try? FileManager.default.moveItem(at: tmpOut, to: destURL)) != nil {
+                    ok = true
+                    if let i = recordings.firstIndex(where: { $0.id == item.id }) {
+                        let bytes = (try? FileManager.default.attributesOfItem(atPath: destURL.path)[.size] as? Int64) ?? item.bytes
+                        recordings[i].state = .ready
+                        recordings[i].format = "mp4"
+                        recordings[i].fileName = destURL.lastPathComponent
+                        recordings[i].relativePath = destURL.path.replacingOccurrences(of: Paths.documentsURL.path + "/", with: "")
+                        recordings[i].bytes = bytes
+                        recordings[i].note = ""
+                    }
+                    try? FileManager.default.removeItem(at: srcURL)
+                }
+            }
+            if !ok, let i = recordings.firstIndex(where: { $0.id == item.id }) {
+                recordings[i].state = .ready
+                recordings[i].note = "Couldn't convert — original kept (open in VLC)"
+            }
+            save()
+        }
     }
 }

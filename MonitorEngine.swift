@@ -269,7 +269,7 @@ final class AppState {
             while !Task.isCancelled {
                 await self?.checkNow(username: username)
                 if Task.isCancelled { break }
-                let interval = await self?.settings.pollInterval ?? 30
+                let interval = self?.settings.pollInterval ?? 30
                 try? await Task.sleep(for: .seconds(interval))
             }
         }
@@ -459,7 +459,7 @@ final class AppState {
                 recordings[idx].note = "Nothing captured"
                 recordings[idx].endedAt = Date()
             } else {
-                // Empty placeholder row (parts already saved) — drop it.
+                // Empty stub row (parts already saved) — drop it.
                 recordings.remove(at: idx)
             }
         } else {

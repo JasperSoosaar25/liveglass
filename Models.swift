@@ -64,6 +64,7 @@ struct RecordingItem: Codable, Identifiable, Equatable {
     enum State: String, Codable {
         case recording
         case ready
+        case converting
         case failed
     }
 
@@ -80,7 +81,9 @@ struct RecordingItem: Codable, Identifiable, Equatable {
     var state: State = .recording
     var note: String = ""
 
-    var isVideoPlayableInApp: Bool { state == .ready && (format == "mp4" || format == "mov") }
+    // .ts is natively decodable by AVPlayer (H.264/AAC MPEG-TS), so it plays in-app
+    // too. Only .flv needs an external player like VLC.
+    var isVideoPlayableInApp: Bool { state == .ready && ["mp4", "mov", "ts"].contains(format) }
 }
 
 // MARK: - Live info returned by TikTokAPI

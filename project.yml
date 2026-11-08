@@ -1,0 +1,64 @@
+name: LiveGlass
+options:
+  bundleIdPrefix: com.liveglass
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: ""
+    CODE_SIGNING_ALLOWED: "NO"
+    DEVELOPMENT_TEAM: ""
+    TARGETED_DEVICE_FAMILY: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "1.0.0"
+
+targets:
+  LiveGlass:
+    type: application
+    platform: iOS
+    sources:
+      - App.swift
+      - Models.swift
+      - GlassUI.swift
+      - TikTokAPI.swift
+      - HLSRecorder.swift
+      - MonitorEngine.swift
+      - MainViews.swift
+      - SettingsViews.swift
+      - Assets.xcassets
+    info:
+      path: Generated/Info.plist
+      properties:
+        CFBundleDisplayName: Live Glass
+        CFBundleShortVersionString: "1.0.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UIBackgroundModes:
+          - audio
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSPhotoLibraryAddUsageDescription: >-
+          Saves finished recordings to your photo library when you enable
+          auto-save or choose to export them.
+        ITSAppUsesNonExemptEncryption: false
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+
+schemes:
+  LiveGlass:
+    build:
+      targets:
+        LiveGlass: all
+    run:
+      config: Debug
+    archive:
+      config: Release

@@ -284,11 +284,15 @@ actor StreamRecorder {
                           fallbackDuration: Double, partIndex: Int, partStart: Date,
                           endReason: String, onEvent: @escaping @Sendable (RecorderEvent) -> Void) async throws -> PartSummary {
 
-        // Build a local HLS playlist that references the downloaded segments.
+        // Build a local VOD HLS playlist that references the downloaded segments.
         let maxDur = max(max(files.map { $0.dur }.max() ?? fallbackDuration, fallbackDuration), 1)
-        var m3u8 = "#EXTM3U\n#EXT-X-VERSION:3\n"
+        // fMP4 playlists require version >= 6 for #EXT-X-MAP — getting this wrong makes
+        // AVAssetExportSession reject the asset (the #1 cause of .ts fallbacks).
+        let hlsVersion = mapFile != nil ? 6 : 3
+        var m3u8 = "#EXTM3U\n#EXT-X-VERSION:\(hlsVersion)\n#EXT-X-PLAYLIST-TYPE:VOD\n"
         m3u8 += "#EXT-X-TARGETDURATION:\(Int(ceil(maxDur)))\n"
         m3u8 += "#EXT-X-MEDIA-SEQUENCE:0\n"
+        m3u8 += "#EXT-X-INDEPENDENT-SEGMENTS\n"
         if let mapFile {
             m3u8 += "#EXT-X-MAP:URI=\"\(mapFile)\"\n"
         }
@@ -306,41 +310,68 @@ actor StreamRecorder {
         try FileManager.default.createDirectory(at: Paths.recordingsRoot, withIntermediateDirectories: true)
         let baseName = "\(Format.sanitizeUsername(username))_\(Format.fileStamp(partStart))_p\(partIndex)"
 
-        // Attempt 1: lossless passthrough remux into MP4 (no re-encode, original quality).
-        let exportCandidate = workDir.appendingPathComponent("export.mp4")
-        if await passthroughExport(playlistURL: playlistURL, output: exportCandidate) {
+        // Adopts a finished MP4 sitting in the work dir: move it to its final name,
+        // emit the part event, clean up. Returns nil when the move fails.
+        func adoptMP4(from tmp: URL) -> PartSummary? {
             let finalURL = Paths.recordingsRoot.appendingPathComponent("\(baseName).mp4")
             try? FileManager.default.removeItem(at: finalURL)
-            do {
-                try FileManager.default.moveItem(at: exportCandidate, to: finalURL)
-                let bytes = fileSize(at: finalURL)
-                try? FileManager.default.removeItem(at: workDir)
-                onEvent(.partFinished(path: finalURL.path, bytes: bytes, duration: totalDuration,
-                                      format: "mp4", quality: qualityLabel))
-                priorSeconds += totalDuration
-                return PartSummary(path: finalURL.path, bytes: bytes, duration: totalDuration, format: "mp4")
-            } catch {
-                // fall through to ts concat
-            }
+            guard (try? FileManager.default.moveItem(at: tmp, to: finalURL)) != nil else { return nil }
+            let bytes = fileSize(at: finalURL)
+            try? FileManager.default.removeItem(at: workDir)
+            onEvent(.partFinished(path: finalURL.path, bytes: bytes, duration: totalDuration,
+                                  format: "mp4", quality: qualityLabel))
+            priorSeconds += totalDuration
+            return PartSummary(path: finalURL.path, bytes: bytes, duration: totalDuration, format: "mp4")
         }
 
-        // Attempt 2: raw concatenation -> .ts (plays in VLC / Infuse; still original quality).
-        // (When the source was fMP4 the concat is an fMP4 stream; players sniff the
-        // container, and the .ts extension avoids promising in-app MP4 playback.)
-        let format = "ts"
-        let tsURL = Paths.recordingsRoot.appendingPathComponent("\(baseName).ts")
-        try? FileManager.default.removeItem(at: tsURL)
-        try concatFiles(in: workDir, names: (mapFile.map { [$0] } ?? []) + files.map { $0.name }, to: tsURL)
-        let bytes = fileSize(at: tsURL)
+        // Attempt 1: lossless passthrough remux of the local playlist into MP4
+        // (no re-encode, original quality).
+        let exportA = workDir.appendingPathComponent("export-a.mp4")
+        try? FileManager.default.removeItem(at: exportA)
+        if await passthroughExport(assetURL: playlistURL, output: exportA),
+           let summary = adoptMP4(from: exportA) {
+            return summary
+        }
+
+        // Attempts 2 and 3 work on the raw concatenated stream (no playlist involved).
+        // fMP4 sources concatenate into a valid fragmented MP4; TS into MPEG-TS.
+        let concatURL = workDir.appendingPathComponent("concat.\(mapFile != nil ? "mp4" : "ts")")
+        try concatFiles(in: workDir, names: (mapFile.map { [$0] } ?? []) + files.map { $0.name }, to: concatURL)
+
+        // Attempt 2: passthrough export straight from the raw stream.
+        let exportB = workDir.appendingPathComponent("export-b.mp4")
+        try? FileManager.default.removeItem(at: exportB)
+        if await passthroughExport(assetURL: concatURL, output: exportB),
+           let summary = adoptMP4(from: exportB) {
+            return summary
+        }
+
+        // Attempt 3: sample-level passthrough remux (AVAssetReader/Writer). Handles
+        // streams the export session refuses — still without re-encoding.
+        let exportC = workDir.appendingPathComponent("export-c.mp4")
+        try? FileManager.default.removeItem(at: exportC)
+        if await Self.remuxToMP4(inputURL: concatURL, outputURL: exportC),
+           let summary = adoptMP4(from: exportC) {
+            return summary
+        }
+
+        // Attempt 4: keep the raw stream. fMP4 sources are already valid MP4 data
+        // (fragmented) and play natively; TS keeps .ts for VLC / Infuse. Players sniff
+        // the container, so the extension just sets expectations.
+        let format = mapFile != nil ? "mp4" : "ts"
+        let rawURL = Paths.recordingsRoot.appendingPathComponent("\(baseName).\(format)")
+        try? FileManager.default.removeItem(at: rawURL)
+        try FileManager.default.moveItem(at: concatURL, to: rawURL)
+        let bytes = fileSize(at: rawURL)
         try? FileManager.default.removeItem(at: workDir)
-        onEvent(.partFinished(path: tsURL.path, bytes: bytes, duration: totalDuration,
+        onEvent(.partFinished(path: rawURL.path, bytes: bytes, duration: totalDuration,
                               format: format, quality: qualityLabel))
         priorSeconds += totalDuration
-        return PartSummary(path: tsURL.path, bytes: bytes, duration: totalDuration, format: format)
+        return PartSummary(path: rawURL.path, bytes: bytes, duration: totalDuration, format: format)
     }
 
-    private func passthroughExport(playlistURL: URL, output: URL) async -> Bool {
-        let asset = AVURLAsset(url: playlistURL)
+    private func passthroughExport(assetURL: URL, output: URL) async -> Bool {
+        let asset = AVURLAsset(url: assetURL)
         guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else {
             return false
         }
@@ -359,6 +390,99 @@ actor StreamRecorder {
         watchdog.cancel()
 
         return session.status == .completed && FileManager.default.fileExists(atPath: output.path)
+    }
+
+    // MARK: - Lossless remux fallback
+
+    /// Container-level remux of any AVFoundation-readable file (raw .ts, fragmented
+    /// .mp4, local HLS) into a plain progressive .mp4 — compressed samples are passed
+    /// through untouched (no re-encode, original quality). Static so one-off UI
+    /// conversions (legacy .ts recordings) can use it too. Returns false on any
+    /// problem; the caller then falls back to keeping the original file.
+    static func remuxToMP4(inputURL: URL, outputURL: URL) async -> Bool {
+        let asset = AVURLAsset(url: inputURL)
+        guard let reader = try? AVAssetReader(asset: asset),
+              let writer = try? AVAssetWriter(outputURL: outputURL, fileType: .mp4) else {
+            return false
+        }
+
+        let videoTracks = (try? await asset.loadTracks(withMediaType: .video)) ?? []
+        let audioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
+        guard !videoTracks.isEmpty || !audioTracks.isEmpty else { return false }
+
+        var outputs: [AVAssetReaderTrackOutput] = []
+        var inputs: [AVAssetWriterInput] = []
+        let trackPairs = videoTracks.map { ($0, AVMediaType.video) }
+            + audioTracks.map { ($0, AVMediaType.audio) }
+        for (track, mediaType) in trackPairs {
+            let out = AVAssetReaderTrackOutput(track: track, outputSettings: nil) // passthrough
+            let hint = (try? await track.load(.formatDescriptions))?.first
+            let input = AVAssetWriterInput(mediaType: mediaType, outputSettings: nil,
+                                           sourceFormatHint: hint)
+            guard reader.canAdd(out), writer.canAdd(input) else { continue }
+            reader.add(out)
+            writer.add(input)
+            outputs.append(out)
+            inputs.append(input)
+        }
+        guard inputs.count == trackPairs.count, !inputs.isEmpty else { return false }
+
+        reader.startReading()
+        writer.startWriting()
+
+        // Prime one sample per track so the writer session can start at the earliest PTS.
+        var primed: [CMSampleBuffer?] = outputs.map { $0.copyNextSampleBuffer() }
+        guard primed.allSatisfy({ $0 != nil }) else {
+            reader.cancelReading()
+            writer.cancelWriting()
+            return false
+        }
+        let startPTS = primed.compactMap { $0 }
+            .map { CMSampleBufferGetPresentationTimeStamp($0) }
+            .min() ?? .zero
+        writer.startSession(atSourceTime: startPTS)
+
+        // Pump loop: pull compressed samples and push them into the MP4 untouched.
+        var done = Array(repeating: false, count: inputs.count)
+        var appendFailed = false
+        let deadline = Date().addingTimeInterval(1800)   // absolute anti-hang cap
+        while !Task.isCancelled {
+            for i in inputs.indices where !done[i] {
+                let input = inputs[i]
+                while input.isReadyForMoreMediaData {
+                    let buf = primed[i] ?? outputs[i].copyNextSampleBuffer()
+                    primed[i] = nil
+                    guard let buf else {
+                        input.markAsFinished()
+                        done[i] = true
+                        break
+                    }
+                    if input.append(buf) {
+                        // keep pumping while the input is ready
+                    } else {
+                        input.markAsFinished()
+                        done[i] = true
+                        appendFailed = true
+                        break
+                    }
+                }
+            }
+            if appendFailed || done.allSatisfy({ $0 }) || Date() > deadline { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+
+        if appendFailed || Task.isCancelled || done.contains(false) {
+            reader.cancelReading()
+            writer.cancelWriting()
+            return false
+        }
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            writer.finishWriting { continuation.resume() }
+        }
+        let ok = writer.status == .completed && FileManager.default.fileExists(atPath: outputURL.path)
+        if !ok { try? FileManager.default.removeItem(at: outputURL) }
+        return ok
     }
 
     private func concatFiles(in root: URL, names: [String], to output: URL) throws {

@@ -146,8 +146,16 @@ final class AppState {
         settings = state.settings
         users = state.users
         // Drop in-progress rows from a previous session; the files themselves were
-        // never finalized, and their temp folders are cleaned below.
-        recordings = state.recordings.filter { $0.state != .recording }
+        // never finalized, and their temp folders are cleaned below. Interrupted
+        // conversions go back to ready (the original file is kept until a convert
+        // succeeds, so nothing is lost).
+        recordings = state.recordings
+            .map { rec -> RecordingItem in
+                var r = rec
+                if r.state == .converting { r.state = .ready }
+                return r
+            }
+            .filter { $0.state != .recording }
         monitoringActive = false // actual resume happens in resumeIfNeeded()
     }
 
